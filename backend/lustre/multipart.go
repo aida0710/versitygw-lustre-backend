@@ -132,18 +132,32 @@ const readFromBufSize = 1024 * 1024
 // 減らせる。remain の超過チェックは既存の Write に委譲する。
 func (w *partWriter) ReadFrom(r io.Reader) (int64, error) {
 	buf := make([]byte, readFromBufSize)
+	return copyCoalesced(w, r, buf)
+}
+
+// copyCoalesced は Reader がネットワーク由来の短い断片を返しても、buf を
+// 可能な限り満たしてから Writer へ渡す。単に r.Read(buf) を繰り返すだけでは、
+// 1MiB の buf を用意していても fasthttp が返す約32KiBごとに pwrite が発生する。
+func copyCoalesced(w io.Writer, r io.Reader, buf []byte) (int64, error) {
+	if len(buf) == 0 {
+		return 0, fmt.Errorf("copy buffer must not be empty")
+	}
+
 	var written int64
 	for {
-		nr, er := r.Read(buf)
+		nr, er := io.ReadFull(r, buf)
 		if nr > 0 {
 			nw, ew := w.Write(buf[:nr])
 			written += int64(nw)
 			if ew != nil {
 				return written, ew
 			}
+			if nw != nr {
+				return written, io.ErrShortWrite
+			}
 		}
 		if er != nil {
-			if er == io.EOF {
+			if errors.Is(er, io.EOF) || errors.Is(er, io.ErrUnexpectedEOF) {
 				return written, nil
 			}
 			return written, er
