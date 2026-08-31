@@ -26,6 +26,8 @@ import (
 
 var (
 	mpuPartSize        int64
+	mpuStripeCount     int
+	mpuStripeThreshold int64
 	disableDirectMpu   bool
 	lustreVersioingDir string
 )
@@ -107,6 +109,19 @@ filesystem from the object data.`,
 				EnvVars:     []string{"VGW_MPU_PART_SIZE"},
 				Destination: &mpuPartSize,
 			},
+			&cli.IntFlag{
+				Name:        "mpu-stripe-count",
+				Usage:       "number of OSTs used after the progressive multipart stripe threshold; 0 or 1 keeps the filesystem default",
+				EnvVars:     []string{"VGW_MPU_STRIPE_COUNT"},
+				Destination: &mpuStripeCount,
+			},
+			&cli.Int64Flag{
+				Name:        "mpu-stripe-threshold",
+				Usage:       "bytes kept on one OST before multipart staging files use --mpu-stripe-count OSTs",
+				EnvVars:     []string{"VGW_MPU_STRIPE_THRESHOLD"},
+				Value:       1 << 30,
+				Destination: &mpuStripeThreshold,
+			},
 			&cli.BoolFlag{
 				Name:        "disable-direct-mpu",
 				Usage:       "write multipart parts to individual files and copy them on completion, as the posix backend does",
@@ -172,6 +187,8 @@ func runLustre(ctx *cli.Context) error {
 		},
 		MetaStore:              ms.storer,
 		PartSize:               mpuPartSize,
+		StripeCount:            mpuStripeCount,
+		StripeThreshold:        mpuStripeThreshold,
 		DisableDirectMultipart: disableDirectMpu,
 	}
 

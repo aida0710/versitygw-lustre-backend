@@ -61,6 +61,12 @@ type Lustre struct {
 	// のかを切り分けるのに使える。
 	directMultipart bool
 
+	// stripeCount と stripeThreshold は multipart ステージングファイルの
+	// Progressive File Layout を制御する。小さいファイルは 1 stripe のままにし、
+	// threshold 以降だけ stripeCount 個の OST に分散する。
+	stripeCount     int
+	stripeThreshold int64
+
 	// posix 側の同等のフィールドは非公開なので、ここのマルチパート実装は自前の
 	// コピーを持つ。
 	newDirPerm fs.FileMode
@@ -121,6 +127,14 @@ type Opts struct {
 	// DisableDirectMultipart は posix のマルチパート経路に戻す。この経路は part
 	// のデータを最終オブジェクトへコピーする。
 	DisableDirectMultipart bool
+
+	// StripeCount は StripeThreshold 以降の multipart ステージングファイルを
+	// 分散する OST 数である。0 または 1 はファイルシステム既定のレイアウトを使う。
+	StripeCount int
+
+	// StripeThreshold は Progressive File Layout の先頭 1-stripe component の
+	// 長さである。StripeCount が 2 以上の場合は正でなければならない。
+	StripeThreshold int64
 }
 
 // New は rootdir を起点とする Lustre バックエンドを生成する。
@@ -146,6 +160,12 @@ func New(rootdir string, metastore meta.MetadataStorer, opts Opts) (*Lustre, err
 	if opts.PartSize < 0 {
 		return nil, fmt.Errorf("invalid part size %d", opts.PartSize)
 	}
+	if opts.StripeCount < 0 {
+		return nil, fmt.Errorf("invalid multipart stripe count %d", opts.StripeCount)
+	}
+	if opts.StripeCount > 1 && opts.StripeThreshold <= 0 {
+		return nil, fmt.Errorf("a positive multipart stripe threshold is required with stripe count %d", opts.StripeCount)
+	}
 
 	p, err := posix.New(rootdir, metastore, opts.Posix)
 	if err != nil {
@@ -163,6 +183,8 @@ func New(rootdir string, metastore meta.MetadataStorer, opts Opts) (*Lustre, err
 		rootdir:         rootdir,
 		partSize:        opts.PartSize,
 		directMultipart: direct,
+		stripeCount:     opts.StripeCount,
+		stripeThreshold: opts.StripeThreshold,
 		newDirPerm:      opts.Posix.NewDirPerm,
 		chownuid:        opts.Posix.ChownUID,
 		chowngid:        opts.Posix.ChownGID,

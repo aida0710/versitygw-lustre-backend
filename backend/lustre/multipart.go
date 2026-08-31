@@ -64,11 +64,8 @@ func (l *Lustre) CreateMultipartUpload(ctx context.Context, mpu s3response.Creat
 // initStaging は全 part のペイロードを保持するスパースファイルを作り、この
 // アップロードがどの part サイズでレイアウトされるかを記録する。
 func (l *Lustre) initStaging(updir string) error {
-	f, err := os.OpenFile(stagingPath(updir), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
-	if err != nil {
-		return fmt.Errorf("create staging file: %w", err)
-	}
-	if err := f.Close(); err != nil {
+	if err := createStagingFile(stagingPath(updir), 0644, l.stripeCount,
+		l.stripeThreshold, runCommand); err != nil {
 		return fmt.Errorf("create staging file: %w", err)
 	}
 
