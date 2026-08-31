@@ -117,10 +117,10 @@ func (w *partWriter) Close() error { return w.f.Close() }
 
 // readFromBufSize は ReadFrom が使う内部バッファのサイズである。
 // io.Copy の既定バッファ (32KiB) のままだと、大きな part の転送が
-// 何百回もの小さな WriteAt(pwrite) syscall に分解されてしまう。
-// Lustre上の1MiB pwriteが平均約5msかかっていたため、4MiBまでまとめて
-// syscall回数とRPC待ちを1/4に減らす。
-const readFromBufSize = 4 * 1024 * 1024
+// 何百回もの小さな WriteAt(pwrite) syscall に分解されてしまう。CPU
+// プロファイルで確認したところ、これがサーバ側 CPU 時間の過半数を
+// 占めていた。生の dd/nc が使う 1MiB ブロックに合わせておく。
+const readFromBufSize = 1024 * 1024
 
 // ReadFrom は io.ReaderFrom を実装する。io.Copy は宛先がこのインター
 // フェースを実装していれば、既定の 32KiB 固定バッファのコピーループに

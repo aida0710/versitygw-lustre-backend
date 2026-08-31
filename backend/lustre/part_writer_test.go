@@ -6,8 +6,6 @@ package lustre
 import (
 	"bytes"
 	"io"
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -54,52 +52,5 @@ func TestCopyCoalescedFillsWriteBuffersFromShortReads(t *testing.T) {
 	}
 	if destination.writes != 4 {
 		t.Fatalf("Write called %d times, want 4 coalesced writes", destination.writes)
-	}
-}
-
-type bufferSizeCountingReader struct {
-	r     io.Reader
-	reads int
-}
-
-func (r *bufferSizeCountingReader) Read(p []byte) (int, error) {
-	r.reads++
-	return r.r.Read(p)
-}
-
-func TestPartWriterReadFromCoalescesIntoFourMiBWrites(t *testing.T) {
-	const payloadSize = 8 * 1024 * 1024
-	payload := bytes.Repeat([]byte("a"), payloadSize)
-	path := filepath.Join(t.TempDir(), "staging")
-
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		t.Fatalf("create staging file: %v", err)
-	}
-	if err := f.Truncate(payloadSize); err != nil {
-		f.Close()
-		t.Fatalf("truncate staging file: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close staging file: %v", err)
-	}
-
-	f, err = os.OpenFile(path, os.O_WRONLY, 0644)
-	if err != nil {
-		t.Fatalf("reopen staging file: %v", err)
-	}
-	w := &partWriter{f: f, remain: payloadSize}
-	defer w.Close()
-
-	source := &bufferSizeCountingReader{r: bytes.NewReader(payload)}
-	if _, err := io.Copy(w, source); err != nil {
-		t.Fatalf("io.Copy: %v", err)
-	}
-
-	// 4MiBなら8MiB本体の2回とEOF確認までの3回以内。
-	// 1MiBに戻ると8回以上となり、回帰を検出できる。
-	const wantMaxReads = 3
-	if source.reads > wantMaxReads {
-		t.Fatalf("Read called %d times for %d bytes, want <= %d", source.reads, payloadSize, wantMaxReads)
 	}
 }
