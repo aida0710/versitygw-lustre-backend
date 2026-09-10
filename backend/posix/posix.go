@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -102,6 +103,16 @@ type Posix struct {
 	// execute blocking syscalls (stat, readdir, xattr, open, etc.), this limiter
 	// constrains parallelism to prevent excessive thread creation under load.
 	actionLimiter *semaphore.Weighted
+
+	// listActionLimiter optionally gives ListObjects requests a dedicated lane
+	// so long-running data transfers cannot occupy every general action slot.
+	// A nil limiter preserves the historical shared action queue.
+	listActionLimiter *semaphore.Weighted
+
+	// listObjectsConcurrency bounds metadata lookups performed concurrently
+	// within one ListObjects page. Request-level concurrency is governed by the
+	// dedicated list limiter when configured, or actionLimiter otherwise.
+	listObjectsConcurrency int
 
 	// copyObjectThreshold is the maximum allowed size (in bytes) for a copy
 	// source object. Requests to copy objects larger than this value are
@@ -185,6 +196,14 @@ type PosixOpts struct {
 	// queue depth grows under sustained load, request latency increases and
 	// upstream timeouts may occur.
 	Concurrency int
+	// ListObjectsRequestConcurrency sets the number of ListObjects requests that
+	// may run outside the general action limiter. Zero keeps ListObjects on the
+	// general action limiter for backwards compatibility.
+	ListObjectsRequestConcurrency int
+	// ListObjectsConcurrency sets the number of object metadata lookups that a
+	// single ListObjects page may perform concurrently. Defaults to 1 to retain
+	// the historical serial behavior.
+	ListObjectsConcurrency int
 	// CopyObjectThreshold sets the maximum allowed source object size (in bytes)
 	// for CopyObject and UploadPartCopy operations. Requests exceeding this
 	// threshold are rejected with an 'InvalidRequest' error. Defaults to the
@@ -242,23 +261,30 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		fmt.Println("Using sidecar directory for metadata:", sidecardirAbs)
 	}
 
+	var listActionLimiter *semaphore.Weighted
+	if opts.ListObjectsRequestConcurrency > 0 {
+		listActionLimiter = semaphore.NewWeighted(int64(opts.ListObjectsRequestConcurrency))
+	}
+
 	return &Posix{
-		meta:                 meta,
-		rootfd:               f,
-		rootdir:              rootdir,
-		euid:                 os.Geteuid(),
-		egid:                 os.Getegid(),
-		chownuid:             opts.ChownUID,
-		chowngid:             opts.ChownGID,
-		bucketlinks:          opts.BucketLinks,
-		versioningDir:        versioningdirAbs,
-		newDirPerm:           opts.NewDirPerm,
-		forceNoTmpFile:       opts.ForceNoTmpFile,
-		forceNoCopyFileRange: opts.ForceNoCopyFileRange,
-		validateBucketName:   opts.ValidateBucketNames,
-		actionLimiter:        semaphore.NewWeighted(int64(concurrencyOrDefault(opts.Concurrency))),
-		copyObjectThreshold:  opts.CopyObjectThreshold,
-		defaultEtag:          opts.DefaultEtag,
+		meta:                   meta,
+		rootfd:                 f,
+		rootdir:                rootdir,
+		euid:                   os.Geteuid(),
+		egid:                   os.Getegid(),
+		chownuid:               opts.ChownUID,
+		chowngid:               opts.ChownGID,
+		bucketlinks:            opts.BucketLinks,
+		versioningDir:          versioningdirAbs,
+		newDirPerm:             opts.NewDirPerm,
+		forceNoTmpFile:         opts.ForceNoTmpFile,
+		forceNoCopyFileRange:   opts.ForceNoCopyFileRange,
+		validateBucketName:     opts.ValidateBucketNames,
+		actionLimiter:          semaphore.NewWeighted(int64(concurrencyOrDefault(opts.Concurrency))),
+		listActionLimiter:      listActionLimiter,
+		listObjectsConcurrency: concurrencyOrOne(opts.ListObjectsConcurrency),
+		copyObjectThreshold:    opts.CopyObjectThreshold,
+		defaultEtag:            opts.DefaultEtag,
 	}, nil
 }
 
@@ -268,6 +294,13 @@ func concurrencyOrDefault(n int) int {
 		return n
 	}
 	return defaultConcurrency
+}
+
+func concurrencyOrOne(n int) int {
+	if n > 0 {
+		return n
+	}
+	return 1
 }
 
 func validateSubDir(root, dir string) (string, error) {
@@ -351,6 +384,23 @@ func (p *Posix) acquireActionSlot(ctx context.Context) (func(), error) {
 
 	return func() {
 		p.actionLimiter.Release(1)
+	}, nil
+}
+
+// acquireListActionSlot reserves a slot for a ListObjects request. When a
+// dedicated list limiter is not configured, it falls back to the general
+// action limiter to preserve the historical behavior.
+func (p *Posix) acquireListActionSlot(ctx context.Context) (func(), error) {
+	if p.listActionLimiter == nil {
+		return p.acquireActionSlot(ctx)
+	}
+
+	if err := p.listActionLimiter.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+
+	return func() {
+		p.listActionLimiter.Release(1)
 	}, nil
 }
 
@@ -5526,7 +5576,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 }
 
 func (p *Posix) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
-	release, err := p.acquireActionSlot(ctx)
+	release, err := p.acquireListActionSlot(ctx)
 	if err != nil {
 		return s3response.ListObjectsResult{}, err
 	}
@@ -5567,7 +5617,8 @@ func (p *Posix) ListObjectsParametrized(ctx context.Context, input *s3.ListObjec
 	}
 
 	fileSystem := os.DirFS(bucket)
-	results, err := backend.Walk(ctx, fileSystem, prefix, delim, marker, maxkeys,
+	results, err := backend.WalkConcurrent(ctx, fileSystem, prefix, delim, marker, maxkeys,
+		p.listObjectsConcurrency,
 		customFileToObj(bucket, true), []string{MetaTmpDir})
 	if err != nil {
 		return s3response.ListObjectsResult{}, fmt.Errorf("walk %v: %w", bucket, err)
@@ -5593,23 +5644,37 @@ func (p *Posix) FileToObj(bucket string, fetchOwner bool) backend.GetObjFunc {
 		}
 	}
 
+	var ownerOnce sync.Once
+	var cachedOwner *types.Owner
+	var ownerErr error
+	getOwner := func() (*types.Owner, error) {
+		ownerOnce.Do(func() {
+			aclJSON, err := p.meta.RetrieveAttribute(nil, bucket, "", aclkey)
+			if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+				ownerErr = fmt.Errorf("get bucket acl: %w", err)
+				return
+			}
+
+			acl, err := auth.ParseACL(aclJSON)
+			if err != nil {
+				ownerErr = err
+				return
+			}
+
+			cachedOwner = &types.Owner{ID: &acl.Owner}
+		})
+		return cachedOwner, ownerErr
+	}
+
 	return func(path string, d fs.DirEntry) (s3response.Object, error) {
 		var owner *types.Owner
 		// Retrieve the object owner data from bucket ACL, if fetchOwner is true
 		// All the objects in the bucket are owned by the bucket owner
 		if fetchOwner {
-			aclJSON, err := p.meta.RetrieveAttribute(nil, bucket, "", aclkey)
-			if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
-				return s3response.Object{}, fmt.Errorf("get bucket acl: %w", err)
-			}
-
-			acl, err := auth.ParseACL(aclJSON)
+			var err error
+			owner, err = getOwner()
 			if err != nil {
 				return s3response.Object{}, err
-			}
-
-			owner = &types.Owner{
-				ID: &acl.Owner,
 			}
 		}
 		if d.IsDir() {
@@ -5698,7 +5763,7 @@ func (p *Posix) FileToObj(bucket string, fetchOwner bool) backend.GetObjFunc {
 }
 
 func (p *Posix) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
-	release, err := p.acquireActionSlot(ctx)
+	release, err := p.acquireListActionSlot(ctx)
 	if err != nil {
 		return s3response.ListObjectsV2Result{}, err
 	}
@@ -5747,7 +5812,8 @@ func (p *Posix) ListObjectsV2Parametrized(ctx context.Context, input *s3.ListObj
 	}
 
 	fileSystem := os.DirFS(bucket)
-	results, err := backend.Walk(ctx, fileSystem, prefix, delim, marker, maxkeys,
+	results, err := backend.WalkConcurrent(ctx, fileSystem, prefix, delim, marker, maxkeys,
+		p.listObjectsConcurrency,
 		customFileToObj(bucket, fetchOwner), []string{MetaTmpDir})
 	if err != nil {
 		return s3response.ListObjectsV2Result{}, fmt.Errorf("walk %v: %w", bucket, err)

@@ -24,16 +24,18 @@ import (
 )
 
 var (
-	chownuid, chowngid   bool
-	bucketlinks          bool
-	versioningDir        string
-	dirPerms             uint
-	sidecar              string
-	nometa               bool
-	forceNoTmpFile       bool
-	forceNoCopyFileRange bool
-	actionsConcurrency   int
-	defaultEtag          string
+	chownuid, chowngid            bool
+	bucketlinks                   bool
+	versioningDir                 string
+	dirPerms                      uint
+	sidecar                       string
+	nometa                        bool
+	forceNoTmpFile                bool
+	forceNoCopyFileRange          bool
+	actionsConcurrency            int
+	listObjectsRequestConcurrency int
+	listObjectsConcurrency        int
+	defaultEtag                   string
 )
 
 func posixCommand() *cli.Command {
@@ -91,6 +93,20 @@ will be translated into the file /mnt/fs/gwroot/mybucket/a/b/c/myobject`,
 				Value:       5000,
 				Destination: &actionsConcurrency,
 			},
+			&cli.IntFlag{
+				Name:        "list-request-concurrency",
+				Usage:       "maximum concurrent ListObjects requests using a dedicated lane; 0 shares the general action queue",
+				EnvVars:     []string{"VGW_LIST_REQUEST_CONCURRENCY"},
+				Value:       0,
+				Destination: &listObjectsRequestConcurrency,
+			},
+			&cli.IntFlag{
+				Name:        "list-concurrency",
+				Usage:       "object metadata lookups allowed concurrently within one ListObjects page",
+				EnvVars:     []string{"VGW_LIST_CONCURRENCY"},
+				Value:       1,
+				Destination: &listObjectsConcurrency,
+			},
 			&cli.BoolFlag{
 				Name:        "disableotmp",
 				Usage:       "disable O_TMPFILE support for new objects",
@@ -127,19 +143,27 @@ func runPosix(ctx *cli.Context) error {
 	if actionsConcurrency <= 0 {
 		return fmt.Errorf("concurrency must be positive, got %d", actionsConcurrency)
 	}
+	if listObjectsRequestConcurrency < 0 {
+		return fmt.Errorf("list request concurrency must be non-negative, got %d", listObjectsRequestConcurrency)
+	}
+	if listObjectsConcurrency <= 0 {
+		return fmt.Errorf("list concurrency must be positive, got %d", listObjectsConcurrency)
+	}
 
 	opts := posix.PosixOpts{
-		ChownUID:             chownuid,
-		ChownGID:             chowngid,
-		BucketLinks:          bucketlinks,
-		VersioningDir:        versioningDir,
-		NewDirPerm:           fs.FileMode(dirPerms),
-		ForceNoTmpFile:       forceNoTmpFile,
-		ForceNoCopyFileRange: forceNoCopyFileRange,
-		ValidateBucketNames:  disableStrictBucketNames,
-		Concurrency:          actionsConcurrency,
-		CopyObjectThreshold:  copyObjectThreshold,
-		DefaultEtag:          defaultEtag,
+		ChownUID:                      chownuid,
+		ChownGID:                      chowngid,
+		BucketLinks:                   bucketlinks,
+		VersioningDir:                 versioningDir,
+		NewDirPerm:                    fs.FileMode(dirPerms),
+		ForceNoTmpFile:                forceNoTmpFile,
+		ForceNoCopyFileRange:          forceNoCopyFileRange,
+		ValidateBucketNames:           disableStrictBucketNames,
+		Concurrency:                   actionsConcurrency,
+		ListObjectsRequestConcurrency: listObjectsRequestConcurrency,
+		ListObjectsConcurrency:        listObjectsConcurrency,
+		CopyObjectThreshold:           copyObjectThreshold,
+		DefaultEtag:                   defaultEtag,
 	}
 
 	ms, err := newMetaStore(gwroot)

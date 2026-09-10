@@ -103,6 +103,20 @@ filesystem from the object data.`,
 				Value:       5000,
 				Destination: &actionsConcurrency,
 			},
+			&cli.IntFlag{
+				Name:        "list-request-concurrency",
+				Usage:       "maximum concurrent ListObjects requests using a dedicated lane; 0 shares the general action queue",
+				EnvVars:     []string{"VGW_LIST_REQUEST_CONCURRENCY"},
+				Value:       0,
+				Destination: &listObjectsRequestConcurrency,
+			},
+			&cli.IntFlag{
+				Name:        "list-concurrency",
+				Usage:       "object metadata lookups allowed concurrently within one ListObjects page",
+				EnvVars:     []string{"VGW_LIST_CONCURRENCY"},
+				Value:       1,
+				Destination: &listObjectsConcurrency,
+			},
 			&cli.Int64Flag{
 				Name:        "mpu-part-size",
 				Usage:       "multipart part size in bytes the clients use. Required unless --disable-direct-mpu is set. Parts of any other size are rejected",
@@ -158,6 +172,12 @@ func runLustre(ctx *cli.Context) error {
 	if actionsConcurrency <= 0 {
 		return fmt.Errorf("concurrency must be positive, got %d", actionsConcurrency)
 	}
+	if listObjectsRequestConcurrency < 0 {
+		return fmt.Errorf("list request concurrency must be non-negative, got %d", listObjectsRequestConcurrency)
+	}
+	if listObjectsConcurrency <= 0 {
+		return fmt.Errorf("list concurrency must be positive, got %d", listObjectsConcurrency)
+	}
 
 	if !disableDirectMpu && mpuPartSize <= 0 {
 		return fmt.Errorf("--mpu-part-size is required: set it to the part size the clients upload with, or pass --disable-direct-mpu to use the copying multipart path")
@@ -173,17 +193,19 @@ func runLustre(ctx *cli.Context) error {
 
 	opts := lustre.Opts{
 		Posix: posix.PosixOpts{
-			ChownUID:            chownuid,
-			ChownGID:            chowngid,
-			BucketLinks:         bucketlinks,
-			VersioningDir:       lustreVersioingDir,
-			NewDirPerm:          fs.FileMode(dirPerms),
-			ForceNoTmpFile:      forceNoTmpFile,
-			ValidateBucketNames: disableStrictBucketNames,
-			Concurrency:         actionsConcurrency,
-			CopyObjectThreshold: copyObjectThreshold,
-			DefaultEtag:         defaultEtag,
-			SideCarDir:          ms.sidecarDir,
+			ChownUID:                      chownuid,
+			ChownGID:                      chowngid,
+			BucketLinks:                   bucketlinks,
+			VersioningDir:                 lustreVersioingDir,
+			NewDirPerm:                    fs.FileMode(dirPerms),
+			ForceNoTmpFile:                forceNoTmpFile,
+			ValidateBucketNames:           disableStrictBucketNames,
+			Concurrency:                   actionsConcurrency,
+			ListObjectsRequestConcurrency: listObjectsRequestConcurrency,
+			ListObjectsConcurrency:        listObjectsConcurrency,
+			CopyObjectThreshold:           copyObjectThreshold,
+			DefaultEtag:                   defaultEtag,
+			SideCarDir:                    ms.sidecarDir,
 		},
 		MetaStore:              ms.storer,
 		PartSize:               mpuPartSize,
