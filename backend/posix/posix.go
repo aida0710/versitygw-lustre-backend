@@ -104,9 +104,14 @@ type Posix struct {
 	// constrains parallelism to prevent excessive thread creation under load.
 	actionLimiter *semaphore.Weighted
 
+	// listActionLimiter optionally gives ListObjects requests a dedicated lane
+	// so long-running data transfers cannot occupy every general action slot.
+	// A nil limiter preserves the historical shared action queue.
+	listActionLimiter *semaphore.Weighted
+
 	// listObjectsConcurrency bounds metadata lookups performed concurrently
-	// within one ListObjects page. Request-level concurrency remains governed by
-	// actionLimiter.
+	// within one ListObjects page. Request-level concurrency is governed by the
+	// dedicated list limiter when configured, or actionLimiter otherwise.
 	listObjectsConcurrency int
 
 	// copyObjectThreshold is the maximum allowed size (in bytes) for a copy
@@ -191,6 +196,10 @@ type PosixOpts struct {
 	// queue depth grows under sustained load, request latency increases and
 	// upstream timeouts may occur.
 	Concurrency int
+	// ListObjectsRequestConcurrency sets the number of ListObjects requests that
+	// may run outside the general action limiter. Zero keeps ListObjects on the
+	// general action limiter for backwards compatibility.
+	ListObjectsRequestConcurrency int
 	// ListObjectsConcurrency sets the number of object metadata lookups that a
 	// single ListObjects page may perform concurrently. Defaults to 1 to retain
 	// the historical serial behavior.
@@ -252,6 +261,11 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		fmt.Println("Using sidecar directory for metadata:", sidecardirAbs)
 	}
 
+	var listActionLimiter *semaphore.Weighted
+	if opts.ListObjectsRequestConcurrency > 0 {
+		listActionLimiter = semaphore.NewWeighted(int64(opts.ListObjectsRequestConcurrency))
+	}
+
 	return &Posix{
 		meta:                   meta,
 		rootfd:                 f,
@@ -267,6 +281,7 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		forceNoCopyFileRange:   opts.ForceNoCopyFileRange,
 		validateBucketName:     opts.ValidateBucketNames,
 		actionLimiter:          semaphore.NewWeighted(int64(concurrencyOrDefault(opts.Concurrency))),
+		listActionLimiter:      listActionLimiter,
 		listObjectsConcurrency: concurrencyOrOne(opts.ListObjectsConcurrency),
 		copyObjectThreshold:    opts.CopyObjectThreshold,
 		defaultEtag:            opts.DefaultEtag,
@@ -369,6 +384,23 @@ func (p *Posix) acquireActionSlot(ctx context.Context) (func(), error) {
 
 	return func() {
 		p.actionLimiter.Release(1)
+	}, nil
+}
+
+// acquireListActionSlot reserves a slot for a ListObjects request. When a
+// dedicated list limiter is not configured, it falls back to the general
+// action limiter to preserve the historical behavior.
+func (p *Posix) acquireListActionSlot(ctx context.Context) (func(), error) {
+	if p.listActionLimiter == nil {
+		return p.acquireActionSlot(ctx)
+	}
+
+	if err := p.listActionLimiter.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+
+	return func() {
+		p.listActionLimiter.Release(1)
 	}, nil
 }
 
@@ -5544,7 +5576,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 }
 
 func (p *Posix) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
-	release, err := p.acquireActionSlot(ctx)
+	release, err := p.acquireListActionSlot(ctx)
 	if err != nil {
 		return s3response.ListObjectsResult{}, err
 	}
@@ -5731,7 +5763,7 @@ func (p *Posix) FileToObj(bucket string, fetchOwner bool) backend.GetObjFunc {
 }
 
 func (p *Posix) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
-	release, err := p.acquireActionSlot(ctx)
+	release, err := p.acquireListActionSlot(ctx)
 	if err != nil {
 		return s3response.ListObjectsV2Result{}, err
 	}

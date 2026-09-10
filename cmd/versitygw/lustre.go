@@ -104,6 +104,13 @@ filesystem from the object data.`,
 				Destination: &actionsConcurrency,
 			},
 			&cli.IntFlag{
+				Name:        "list-request-concurrency",
+				Usage:       "maximum concurrent ListObjects requests using a dedicated lane; 0 shares the general action queue",
+				EnvVars:     []string{"VGW_LIST_REQUEST_CONCURRENCY"},
+				Value:       0,
+				Destination: &listObjectsRequestConcurrency,
+			},
+			&cli.IntFlag{
 				Name:        "list-concurrency",
 				Usage:       "object metadata lookups allowed concurrently within one ListObjects page",
 				EnvVars:     []string{"VGW_LIST_CONCURRENCY"},
@@ -165,6 +172,9 @@ func runLustre(ctx *cli.Context) error {
 	if actionsConcurrency <= 0 {
 		return fmt.Errorf("concurrency must be positive, got %d", actionsConcurrency)
 	}
+	if listObjectsRequestConcurrency < 0 {
+		return fmt.Errorf("list request concurrency must be non-negative, got %d", listObjectsRequestConcurrency)
+	}
 	if listObjectsConcurrency <= 0 {
 		return fmt.Errorf("list concurrency must be positive, got %d", listObjectsConcurrency)
 	}
@@ -183,18 +193,19 @@ func runLustre(ctx *cli.Context) error {
 
 	opts := lustre.Opts{
 		Posix: posix.PosixOpts{
-			ChownUID:               chownuid,
-			ChownGID:               chowngid,
-			BucketLinks:            bucketlinks,
-			VersioningDir:          lustreVersioingDir,
-			NewDirPerm:             fs.FileMode(dirPerms),
-			ForceNoTmpFile:         forceNoTmpFile,
-			ValidateBucketNames:    disableStrictBucketNames,
-			Concurrency:            actionsConcurrency,
-			ListObjectsConcurrency: listObjectsConcurrency,
-			CopyObjectThreshold:    copyObjectThreshold,
-			DefaultEtag:            defaultEtag,
-			SideCarDir:             ms.sidecarDir,
+			ChownUID:                      chownuid,
+			ChownGID:                      chowngid,
+			BucketLinks:                   bucketlinks,
+			VersioningDir:                 lustreVersioingDir,
+			NewDirPerm:                    fs.FileMode(dirPerms),
+			ForceNoTmpFile:                forceNoTmpFile,
+			ValidateBucketNames:           disableStrictBucketNames,
+			Concurrency:                   actionsConcurrency,
+			ListObjectsRequestConcurrency: listObjectsRequestConcurrency,
+			ListObjectsConcurrency:        listObjectsConcurrency,
+			CopyObjectThreshold:           copyObjectThreshold,
+			DefaultEtag:                   defaultEtag,
+			SideCarDir:                    ms.sidecarDir,
 		},
 		MetaStore:              ms.storer,
 		PartSize:               mpuPartSize,
