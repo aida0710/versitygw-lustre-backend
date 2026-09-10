@@ -22,6 +22,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -42,18 +43,20 @@ type WalkResults struct {
 
 // walkState holds the state needed during directory traversal
 type walkState struct {
-	ctx        context.Context
-	fileSystem fs.FS
-	prefix     string
-	delimiter  string
-	marker     string
-	max        int32
-	getObj     GetObjFunc
-	skipdirs   []string
+	ctx         context.Context
+	fileSystem  fs.FS
+	prefix      string
+	delimiter   string
+	marker      string
+	max         int32
+	getObj      GetObjFunc
+	skipdirs    []string
+	concurrency int
 
 	// Mutable state
 	cpmap     cpMap
 	objects   []s3response.Object
+	pending   []walkEntry
 	pastMax   bool
 	newMarker string
 	truncated bool
@@ -61,6 +64,11 @@ type walkState struct {
 }
 
 type GetObjFunc func(path string, d fs.DirEntry) (s3response.Object, error)
+
+type walkEntry struct {
+	path string
+	d    fs.DirEntry
+}
 
 var ErrSkipObj = errors.New("skip this object")
 
@@ -95,23 +103,40 @@ func (c cpMap) CpArray() []types.CommonPrefix {
 // Walk walks the supplied fs.FS and returns results compatible with list
 // objects responses
 func Walk(ctx context.Context, fileSystem fs.FS, prefix, delimiter, marker string, max int32, getObj GetObjFunc, skipdirs []string) (WalkResults, error) {
+	return WalkConcurrent(ctx, fileSystem, prefix, delimiter, marker, max, 1, getObj, skipdirs)
+}
+
+// WalkConcurrent walks the supplied fs.FS like Walk, but resolves object
+// metadata for independent entries concurrently. Results are still committed
+// in lexical traversal order, so pagination markers and response ordering are
+// identical to Walk. Delimited listings remain serial because common prefixes
+// and object results share the same page limit. When concurrency is greater
+// than one, getObj must be safe for concurrent use.
+func WalkConcurrent(ctx context.Context, fileSystem fs.FS, prefix, delimiter, marker string, max int32, concurrency int, getObj GetObjFunc, skipdirs []string) (WalkResults, error) {
 	// if max is 0, it should return empty non-truncated result
 	if max == 0 {
 		return WalkResults{
 			Truncated: false,
 		}, nil
 	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
 
 	state := &walkState{
-		ctx:        ctx,
-		fileSystem: fileSystem,
-		prefix:     prefix,
-		delimiter:  delimiter,
-		marker:     marker,
-		max:        max,
-		getObj:     getObj,
-		skipdirs:   skipdirs,
-		cpmap:      cpMap{},
+		ctx:         ctx,
+		fileSystem:  fileSystem,
+		prefix:      prefix,
+		delimiter:   delimiter,
+		marker:      marker,
+		max:         max,
+		getObj:      getObj,
+		skipdirs:    skipdirs,
+		concurrency: concurrency,
+		cpmap:       cpMap{},
+	}
+	if delimiter != "" {
+		state.concurrency = 1
 	}
 
 	qwErr := quickWalk(state)
@@ -399,6 +424,9 @@ func readDirEntries(path string, entries []fs.DirEntry, walkstate *walkState) {
 			if currentObjectName > walkstate.marker {
 				if !checkAndMaybeAddCommonPrefix(currentObjectName, walkstate) {
 					addContentEntry(currentObjectName, entries[entriesIndex], walkstate)
+					if walkstate.walkErr != nil {
+						return
+					}
 				}
 			}
 			entriesIndex++
@@ -453,6 +481,9 @@ func processDir(
 				if currentObjectName > walkstate.marker {
 					if !checkAndMaybeAddCommonPrefix(currentObjectName, walkstate) {
 						addContentEntry(currentObjectName, entries[entriesIndex], walkstate)
+						if walkstate.walkErr != nil {
+							return entriesIndex
+						}
 					}
 				}
 				entriesIndex++
@@ -482,14 +513,9 @@ func processDir(
 				return entriesIndex
 			}
 		} else {
-			dirobj, err := walkstate.getObj(fullObjectName, entries[currentEntry])
-			if err == ErrSkipObj {
-				// Directory exists in the filesystem but is not an object.
-			} else if err != nil {
-				walkstate.walkErr = fmt.Errorf("directory to object %q: %w", fullObjectName, err)
+			addContentEntry(fullObjectName, entries[currentEntry], walkstate)
+			if walkstate.walkErr != nil {
 				return entriesIndex
-			} else {
-				walkstate.addObject(dirobj, fullObjectName)
 			}
 		}
 	} else {
@@ -553,17 +579,62 @@ func shouldSkip(name string, walkstate *walkState) bool {
 }
 
 func addContentEntry(objectName string, dirEntry fs.DirEntry, walkstate *walkState) bool {
-	obj, err := walkstate.getObj(objectName, dirEntry)
-	if err == ErrSkipObj {
-		return false
+	walkstate.pending = append(walkstate.pending, walkEntry{path: objectName, d: dirEntry})
+	remaining := int(walkstate.max) - len(walkstate.objects) - walkstate.cpmap.Len()
+	if len(walkstate.pending) >= walkstate.concurrency || len(walkstate.pending) >= remaining {
+		walkstate.flushPending()
 	}
-	if err != nil {
-		walkstate.walkErr = fmt.Errorf("file to object %q: %w", objectName, err)
-		return false
+	return walkstate.walkErr == nil
+}
+
+func (w *walkState) flushPending() {
+	if len(w.pending) == 0 || w.walkErr != nil {
+		return
+	}
+	if err := w.ctx.Err(); err != nil {
+		w.walkErr = err
+		return
 	}
 
-	walkstate.addObject(obj, objectName)
-	return true
+	pending := w.pending
+	w.pending = nil
+	objects := make([]s3response.Object, len(pending))
+	errs := make([]error, len(pending))
+
+	if w.concurrency == 1 {
+		objects[0], errs[0] = w.getObj(pending[0].path, pending[0].d)
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(len(pending))
+		for i := range pending {
+			go func(i int) {
+				defer wg.Done()
+				objects[i], errs[i] = w.getObj(pending[i].path, pending[i].d)
+			}(i)
+		}
+		wg.Wait()
+	}
+
+	for i, entry := range pending {
+		if w.pastMax {
+			// The serial walker treats any further non-skipped filesystem entry
+			// as proof that the page is truncated, before resolving its metadata.
+			w.truncated = true
+			return
+		}
+		if errs[i] == ErrSkipObj {
+			continue
+		}
+		if errs[i] != nil {
+			kind := "file"
+			if entry.d.IsDir() {
+				kind = "directory"
+			}
+			w.walkErr = fmt.Errorf("%s to object %q: %w", kind, entry.path, errs[i])
+			return
+		}
+		w.addObject(objects[i], entry.path)
+	}
 }
 
 // addObject adds an object to the results and checks if limits are reached
@@ -642,6 +713,7 @@ func quickWalk(walkstate *walkState) error {
 	} else {
 		readDir(rootDir, walkstate)
 	}
+	walkstate.flushPending()
 	if walkstate.walkErr != nil {
 		return walkstate.walkErr
 	}

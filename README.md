@@ -51,6 +51,9 @@ ROOT_ACCESS_KEY="testuser" ROOT_SECRET_KEY="secret" ./versitygw --port :10000 --
 | `--metadb <dir>` | 属性をバケット単位の SQLite データベースに格納する。オブジェクトデータとは別のファイルシステムに置ける。`posix` バックエンドでも利用可 |
 | `--mpu-part-size <bytes>` | クライアントが送る part サイズ。**必須**（`--disable-direct-mpu` 指定時を除く） |
 | `--disable-direct-mpu` | `posix` と同じコピー方式に戻す。バージョニングを使う場合に必要 |
+| `--list-concurrency <n>` | 1回の `ListObjects` 内で並列実行するメタデータ取得数。既定値は `1`。高レイテンシなメタデータストアでは `8` や `16` から調整する |
+
+`--list-concurrency` はレスポンス順序や継続トークンを変えず、各オブジェクトの属性と `stat` の取得だけを並列化します。`delimiter` を指定した一覧は、共通プレフィックスとオブジェクトが同じ件数上限を共有するため直列のままです。メタデータサーバへの同時アクセス数は、おおむね「同時 `ListObjects` リクエスト数 × `--list-concurrency`」で増えるため、MDS負荷と通常のPUT/GETレイテンシを見ながら段階的に上げてください。
 
 #### part サイズは固定です
 
