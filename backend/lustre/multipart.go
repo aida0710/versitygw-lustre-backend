@@ -115,6 +115,16 @@ func (w *partWriter) Write(b []byte) (int, error) {
 
 func (w *partWriter) Close() error { return w.f.Close() }
 
+// syncStaging はステージングファイルに書いたペイロードをディスクまで書き切る。
+// Lustre は client が OST から evict されると、fsync されていない dirty page を
+// 黙って捨てる (2026-10-05〜08 に moon07 で 60 回以上)。MD5 を確かめて part の成功を
+// 返した後にペイロードが失われると、完成したオブジェクトは size だけ正しいまま壊れる
+// ので、part の成功はこれが通ってから返す。テストで差し替えられるよう変数にしてある。
+var syncStaging = func(f *os.File) error { return f.Sync() }
+
+// Sync は part のペイロードをディスクまで書き切る。
+func (w *partWriter) Sync() error { return syncStaging(w.f) }
+
 // readFromBufSize は ReadFrom が使う内部バッファのサイズである。
 // io.Copy の既定バッファ (32KiB) のままだと、大きな part の転送が
 // 何百回もの小さな WriteAt(pwrite) syscall に分解されてしまう。CPU
@@ -374,6 +384,11 @@ func (l *Lustre) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3
 		return nil, fmt.Errorf("write part data: %w", err)
 	}
 
+	// part を可視化する前に、ペイロードがディスクに載ったことを確かめる。失敗した
+	// part は見えないままなので、クライアントはエラーを受けて送り直す。
+	if err := w.Sync(); err != nil {
+		return nil, fmt.Errorf("sync part data: %w", err)
+	}
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("write part data: %w", err)
 	}
@@ -545,6 +560,9 @@ func relocateIntoSlot(updir string, part int32, size, off int64) error {
 	w := &partWriter{f: dst, off: off, remain: size}
 	if _, err := io.Copy(w, io.LimitReader(src, size)); err != nil {
 		return fmt.Errorf("stage copied part: %w", err)
+	}
+	if err := syncStaging(dst); err != nil {
+		return fmt.Errorf("sync copied part: %w", err)
 	}
 	if err := dst.Close(); err != nil {
 		return fmt.Errorf("stage copied part: %w", err)
